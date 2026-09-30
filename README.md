@@ -1,0 +1,102 @@
+# Eyedot Zigbee 网关：Home Assistant 集成
+
+通过局域网直接连接 Eyedot / ZSKJ 原厂兼容 Zigbee 网关，将已登记的三路开关接入 Home Assistant。支持 HA 原生配置界面和 HACS 安装，无需单独运行 MQTT 桥接容器。
+
+这是社区自定义集成；发布到公开仓库不代表已列入 HA 官方集成目录或 HACS 默认列表。
+
+首版面向 Home Assistant 2026.9 及更新版本；已在 2026.9.4 的真实 HA 核心中测试。
+
+## 支持范围
+
+| 对象 | 当前状态 |
+|---|---|
+| 原厂兼容 UBIA 本地网关 | 已实物验证一台 GC-MN-01 外形的无标样机 |
+| 网关样机自报信息 | ZSKJ、IPC_V2.0、固件 02.00.00.55 |
+| SW-N3-01 三路开关，设备类型 13 | 已验证左、中、右三路控制及面板状态回传 |
+| 同一网关中的多只三路开关 | 支持自动发现；通过模拟设备目录验证 |
+| 多只网关 | 支持分别添加，按各自 UID 去重 |
+| 其他开关、传感器、窗帘或场景面板 | 暂不创建控制实体；目录信息保留供诊断 |
+
+外壳相同不保证所有批次固件兼容。添加时会实际验证网关发现、传输握手、登录和设备目录，不会仅按外观判断。
+
+## HACS 安装
+
+1. 在 HACS 中打开“自定义存储库”。
+2. 填入 `https://github.com/mocelgoogstnuocca2015-ui/eyedot-zigbee-gateway-ha`，类别选 **Integration**。
+3. 找到 **Eyedot Zigbee 网关**，下载后重启 Home Assistant。
+4. 打开 **设置 → 设备与服务 → 添加集成**，搜索 **Eyedot Zigbee 网关**。
+5. 填写自己网关的局域网 IPv4、账号和密码。UID 留空可自动发现，也可手工填写底部标签的 20 位编号。
+
+安装路径与自定义仓库结构按 [HACS 集成发布说明](https://www.hacs.xyz/docs/publish/integration/)组织。
+
+## 手动安装
+
+下载 Release 安装包，将其中的 `custom_components/eyedot_gateway` 目录放到 HA 的 `/config/custom_components/eyedot_gateway`，重启 HA，再按上面的第 4、5 步添加。
+
+最终目录应类似：
+
+```text
+/config/custom_components/eyedot_gateway/
+    manifest.json
+    __init__.py
+    config_flow.py
+    client.py
+    coordinator.py
+    switch.py
+    button.py
+    diagnostics.py
+    protocol/
+    translations/
+    brand/
+```
+
+HA 会从配置目录下的 `custom_components` 加载自定义集成，见 [HA 文件结构说明](https://developers.home-assistant.io/docs/creating_integration_file_structure/)。
+
+## 网关与开关准备
+
+- 网关需持续通电并连接网线，与 HA 处于可互通的局域网；建议在路由器中保留其 DHCP 地址。
+- 网关账号与 MQTT 账号无关。本次实测样机接受出厂组合 `admin/admin`，其他设备需核对其实际账号。
+- 运行时不需要 Windows、嗅探器、原厂云服务或 HA 的 Zigbee USB 协调器。集成只使用指定网关的局域网接口。
+- 已登记的三路开关自动出现三个原生开关实体，名称对应左路、中路、右路。
+- 新网关没有设备时，仍能添加网关，并提供“配对新开关”按钮。
+
+## 配对新开关
+
+1. 打开该网关的设备页面，按 **配对新开关**。
+2. 在两分钟内按开关实际的配网方法让它进入搜索模式，开始闪烁后松开，避免连续重置。
+3. 集成收到新的类型 13 对码事件后，保存到“智能家居”房间，随后自动增加三个开关实体。已有设备的重复对码不再次登记。
+4. 打开按钮详情可查看“配对状态”和“配对错误”；失败时也会在日志中说明。
+5. 等开关结束配对操作后，测试三路开关和面板状态回传。
+
+侧键准确时长尚未取得说明书或固件证明，不能承诺一次或两次长按都是固定流程。LED 变暗、闪烁或停止闪烁也不能单独证明入网成功。以实际控制和状态回传为准。
+
+## 维护和诊断
+
+- 网关 IP 改变时，在集成菜单中选择“重新配置”；它会核对 UID，避免误连其他网关。
+- 账号失效会进入重新认证流程。
+- 默认每 5 秒读取一次状态，选项中可改为 2 至 8 秒。
+- 控制命令收到成功码后还会读回目标状态，失败会报错，不猜测开关已动作。
+- 网关可能缓存开关状态，因此短时无线掉线不一定立刻显示不可用。
+- 下载诊断时会移除 IP、账号、密码与完整 UID；报告只保留设备类型、索引和状态。
+- 卸载集成会关闭本地会话。无任何刷写固件、清空设备、修改 Zigbee 信道或网络密钥的操作。
+
+旧 MQTT 桥接和本集成属于两种独立接入方式。已经使用旧桥接的用户，安装本集成后会出现另一组实体；确认原生实体工作后，再按自己需要停用旧桥接。
+
+## 开发与验证
+
+协议实现根据真实抓包与旧 App 调用流程独立还原，未附带原厂 APK、原生 SDK、IDA 数据库或抓包文件。
+
+12 项自动化检查已在 HA 2026.9.4 核心镜像中通过，覆盖旧目录字段、空目录、控制确认、配置与重新认证、动态设备、配对入口及卸载。另在隔离 HA 实例中连接真实网关，完成三个原生实体创建、左路实际控制和 30 秒会话读取验证。
+
+测试使用 HA 核心镜像并禁用容器网络：
+
+```bash
+docker run --rm --network none \
+  --entrypoint python3 \
+  --mount "type=bind,src=$(pwd),dst=/work,ro" \
+  --workdir /work \
+  ghcr.io/home-assistant/qemux86-64-homeassistant:2026.9.4 \
+  -m unittest discover -s tests -v
+```
+
+请通过 GitHub Issues 提交网关硬件及固件版本、设备型号和脱敏诊断。不要上传密码或完整个人配置文件。

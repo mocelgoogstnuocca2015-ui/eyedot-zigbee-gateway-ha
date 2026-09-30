@@ -1,0 +1,60 @@
+{
+  "title": "Eyedot Zigbee 网关",
+  "config": {
+    "step": {
+      "user": {
+        "title": "连接 Eyedot Zigbee 网关",
+        "description": "填写本机局域网中的网关地址与网关账号。UID 可留空自动发现；不需要 MQTT、嗅探器或 Zigbee USB 协调器。",
+        "data": {
+          "host": "网关 IP 地址",
+          "username": "网关账号",
+          "password": "网关密码",
+          "uid": "网关 UID（留空自动发现）"
+        }
+      },
+      "reconfigure": {
+        "title": "连接 Eyedot Zigbee 网关",
+        "description": "填写本机局域网中的网关地址与网关账号。UID 可留空自动发现；不需要 MQTT、嗅探器或 Zigbee USB 协调器。",
+        "data": {
+          "host": "网关 IP 地址",
+          "username": "网关账号",
+          "password": "网关密码",
+          "uid": "网关 UID（留空自动发现）"
+        }
+      },
+      "reauth_confirm": {
+        "title": "连接 Eyedot Zigbee 网关",
+        "description": "填写本机局域网中的网关地址与网关账号。UID 可留空自动发现；不需要 MQTT、嗅探器或 Zigbee USB 协调器。",
+        "data": {
+          "host": "网关 IP 地址",
+          "username": "网关账号",
+          "password": "网关密码",
+          "uid": "网关 UID（留空自动发现）"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接网关，请核对 IP、网线和局域网连通性。",
+      "invalid_auth": "网关账号或密码不正确。",
+      "invalid_config": "请检查局域网 IPv4、UID 和账号密码长度。",
+      "unsupported_gateway": "网关回复与当前已验证的设备目录协议不兼容。"
+    },
+    "abort": {
+      "already_configured": "这只网关已经添加。",
+      "unique_id_mismatch": "当前 IP 对应的网关 UID 与原配置不同。",
+      "reauth_successful": "重新认证成功。",
+      "reconfigure_successful": "网关连接配置已更新。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "状态刷新",
+        "description": "间隔限制在 2 至 8 秒，以维持旧网关会话。",
+        "data": {
+          "scan_interval": "刷新间隔（秒）"
+        }
+      }
+    }
+  }
+}

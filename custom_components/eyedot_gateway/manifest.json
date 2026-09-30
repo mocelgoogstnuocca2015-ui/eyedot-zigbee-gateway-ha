@@ -1,0 +1,14 @@
+{
+  "domain": "eyedot_gateway",
+  "name": "Eyedot Zigbee 网关",
+  "version": "0.1.0",
+  "config_flow": true,
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "codeowners": [
+    "@mocelgoogstnuocca2015-ui"
+  ],
+  "documentation": "https://github.com/mocelgoogstnuocca2015-ui/eyedot-zigbee-gateway-ha",
+  "issue_tracker": "https://github.com/mocelgoogstnuocca2015-ui/eyedot-zigbee-gateway-ha/issues",
+  "requirements": []
+}
