@@ -26,6 +26,10 @@ class FakeClient:
         self.uid = uid
         self.closed = False
         self.cancel_pairing = threading.Event()
+        self.event_notify = None
+        self.event_listener_running = False
+        self.event_notifications = 0
+        self.last_event_received_at = None
         self.rows = {0: DeviceState(0, "测试开关", 13, 128), 1: DeviceState(1, "未知设备", 17, None)}
 
     def fetch(self):
@@ -40,6 +44,11 @@ class FakeClient:
     def close(self):
         self.closed = True
         self.cancel_pairing.set()
+        self.event_listener_running = False
+
+    def start_events(self, notify):
+        self.event_notify = notify
+        self.event_listener_running = True
 
     def pair(self):
         self.rows[2] = DeviceState(2, "新配对开关", 13, 128)
@@ -161,3 +170,33 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.runtime_data.pair_status, "已完成")
         rows = entity_registry.async_entries_for_config_entry(registry, entry.entry_id)
         self.assertEqual(len([row for row in rows if row.domain == "switch"]), 6)
+
+    async def test_push_updates_both_quick_changes_without_waiting_for_poll(self):
+        import threading
+        entry = await self.add_entry()
+        coordinator = entry.runtime_data
+        registry = entity_registry.async_get(self.hass)
+        identity = hashlib.sha256(f"{UID}:0".encode()).hexdigest()[:16]
+        entity = registry.async_get_entity_id("switch", DOMAIN, identity + "_0")
+        for value, expected in [(129, "on"), (128, "off")]:
+            coordinator.client.rows[0] = DeviceState(0, "测试开关", 13, value)
+            producer = threading.Thread(target=coordinator.client.event_notify)
+            producer.start()
+            producer.join()
+            deadline = self.hass.loop.time() + 1
+            while self.hass.states.get(entity).state != expected and self.hass.loop.time() < deadline:
+                await __import__("asyncio").sleep(0.01)
+            self.assertEqual(self.hass.states.get(entity).state, expected)
+
+    async def test_complete_push_writes_state_without_fetching_again(self):
+        entry = await self.add_entry()
+        coordinator = entry.runtime_data
+        registry = entity_registry.async_get(self.hass)
+        identity = hashlib.sha256(f"{UID}:0".encode()).hexdigest()[:16]
+        entity = registry.async_get_entity_id("switch", DOMAIN, identity + "_0")
+        with patch.object(coordinator.client, "fetch", side_effect=AssertionError("完整推送不应额外读取")):
+            coordinator.client.event_notify({0: (13, 129)}, False, self.hass.loop.time())
+            deadline = self.hass.loop.time() + 1
+            while self.hass.states.get(entity).state != "on" and self.hass.loop.time() < deadline:
+                await __import__("asyncio").sleep(0.01)
+            self.assertEqual(self.hass.states.get(entity).state, "on")

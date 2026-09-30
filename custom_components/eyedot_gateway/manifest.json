@@ -1,7 +1,7 @@
 {
   "domain": "eyedot_gateway",
   "name": "Eyedot Zigbee 网关",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "config_flow": true,
   "integration_type": "hub",
   "iot_class": "local_polling",

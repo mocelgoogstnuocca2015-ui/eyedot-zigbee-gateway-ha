@@ -1,9 +1,13 @@
 """验证未经确认的控制、未知设备类型与会话关闭行为。"""
 
 import unittest
+import threading
+import time
+from collections import deque
 from unittest.mock import patch
 
-from custom_components.eyedot_gateway.client import GatewayClient, SetupSession
+from custom_components.eyedot_gateway.client import GatewayClient, NativeSession, SetupSession
+from custom_components.eyedot_gateway.protocol.ubia_read_session import IO_HEADER, NativePacket, NativeReadSession
 
 
 class FakeNative:
@@ -11,6 +15,9 @@ class FakeNative:
         self.device_type = device_type
         self.commands = []
         self.closed = False
+        self.event_pending = False
+        self.pump_calls = 0
+        self.last_state_event_at = None
 
     def read_devices(self):
         return [{"index": 0, "type": self.device_type, "name": "测试开关"}]
@@ -23,6 +30,16 @@ class FakeNative:
 
     def close(self):
         self.closed = True
+
+    def pump(self):
+        self.pump_calls += 1
+        time.sleep(0.01)
+        changed = self.event_pending
+        self.event_pending = False
+        return changed
+
+    def take_push_updates(self):
+        return {}, True
 
 
 class ClientTests(unittest.TestCase):
@@ -65,3 +82,61 @@ class ClientTests(unittest.TestCase):
         native.query = lambda name: self.fail("空网关不应读取会返回 -1 的状态目录")
         client._session = native
         self.assertEqual(client.fetch(), {})
+
+    def test_event_received_during_query_is_preserved_and_duplicate_is_acked(self):
+        session = NativeSession.__new__(NativeSession)
+        session.stop_event = None
+        session.channel = 0
+        session._state_event_pending = False
+        session._recent_events = deque(maxlen=64)
+        session.state_event_count = 0
+        session._push_updates = {}
+        session._push_requires_refresh = False
+        ack = []
+        session._send_av = ack.append
+        packet = NativePacket(0x0408, 0x12, 1, 0, IO_HEADER.pack(3, 0, 4, 0x2316, 7, 0) + bytes(4))
+        with patch.object(NativeReadSession, "_poll", return_value=(packet, ("192.168.50.2", 32761))):
+            session._poll(time.monotonic() + 1)
+        with patch.object(NativeReadSession, "_poll", return_value=None):
+            self.assertTrue(session.pump())
+            self.assertFalse(session.pump())
+        with patch.object(NativeReadSession, "_poll", return_value=(packet, ("192.168.50.2", 32761))):
+            self.assertFalse(session.pump())
+        self.assertEqual(session.state_event_count, 1)
+        self.assertEqual(ack, [IO_HEADER.pack(4, 0, 0, 0x2316, 7, 0)])
+
+    def test_listener_yields_to_requests_and_stops_on_close(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        native = FakeNative()
+        client._session = native
+        observed = threading.Event()
+        try:
+            with client._lock:
+                client.start_events(lambda *_: observed.set())
+                native.event_pending = True
+                time.sleep(0.06)
+                self.assertEqual(native.pump_calls, 0)
+            self.assertTrue(observed.wait(0.5))
+            self.assertTrue(client.event_listener_running)
+        finally:
+            client.close()
+        self.assertFalse(client.event_listener_running)
+        self.assertTrue(native.closed)
+
+    def test_complete_switch_push_contains_state_without_extra_query(self):
+        session = NativeSession.__new__(NativeSession)
+        session.stop_event = None
+        session.channel = 0
+        session._state_event_pending = False
+        session._recent_events = deque(maxlen=64)
+        session.state_event_count = 0
+        session._push_updates = {}
+        session._push_requires_refresh = False
+        session._send_av = lambda _: None
+        body = bytearray(24)
+        body[12:15] = bytes([7, 13, 0x85])
+        packet = NativePacket(0x0408, 0x12, 1, 0, IO_HEADER.pack(3, 0, 24, 0x2003, 9, 0) + body)
+        with patch.object(NativeReadSession, "_poll", return_value=(packet, ("192.168.50.2", 32761))):
+            self.assertTrue(session.pump())
+        self.assertEqual(session.take_push_updates(), ({7: (13, 0x85)}, False))
+        self.assertEqual(session.take_push_updates(), ({}, False))

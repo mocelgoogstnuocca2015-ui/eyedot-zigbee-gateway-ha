@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
+from dataclasses import replace
 
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .client import GatewayClient
@@ -23,12 +26,20 @@ class EyedotCoordinator(DataUpdateCoordinator):
         self.pair_task = None
         self.pair_status = "未开始"
         self.pair_error = None
+        self._closing = False
+        self._push_pending = False
+        self._push_task = None
+        self._operation_lock = asyncio.Lock()
+        self.last_push_refresh_seconds = None
+        self._push_updates = {}
+        self._push_received_at = None
 
     async def _async_update_data(self):
         if self.pair_task and not self.pair_task.done():
             return self.data or {}
         try:
-            return await self.hass.async_add_executor_job(self.client.fetch)
+            async with self._operation_lock:
+                return await self.hass.async_add_executor_job(self.client.fetch)
         except PermissionError as error:
             raise ConfigEntryAuthFailed("网关登录失效，请重新认证") from error
         except (OSError, ValueError, RuntimeError, TimeoutError) as error:
@@ -38,11 +49,57 @@ class EyedotCoordinator(DataUpdateCoordinator):
         if self.pair_task and not self.pair_task.done():
             raise HomeAssistantError("网关正在配对，请等待完成后控制")
         try:
-            data = await self.hass.async_add_executor_job(self.client.control, index, channel, on)
+            async with self._operation_lock:
+                data = await self.hass.async_add_executor_job(self.client.control, index, channel, on)
+                self.async_set_updated_data(data)
         except (OSError, ValueError, RuntimeError, TimeoutError) as error:
             await self.async_request_refresh()
             raise HomeAssistantError(f"没有确认开关状态：{error}") from error
-        self.async_set_updated_data(data)
+
+    async def async_start_events(self):
+        def notify(updates=None, needs_refresh=True, received_at=None):
+            if not self.hass.loop.is_closed():
+                self.hass.loop.call_soon_threadsafe(self._queue_push_refresh, updates or {}, needs_refresh, received_at)
+
+        await self.hass.async_add_executor_job(self.client.start_events, notify)
+
+    @callback
+    def _queue_push_refresh(self, updates=None, needs_refresh=True, received_at=None):
+        if self._closing:
+            return
+        self._push_pending = self._push_pending or needs_refresh
+        self._push_updates.update(updates or {})
+        self._push_received_at = received_at or self.client.last_event_received_at
+        if self._push_task is None or self._push_task.done():
+            self._push_task = self.hass.async_create_background_task(self._async_push_refresh(), "Eyedot 实时状态刷新")
+
+    async def _async_push_refresh(self):
+        try:
+            # 完整状态推送直接写入；只有需要读取目录时合并 30 毫秒，避免额外请求。
+            if not self._push_updates:
+                await asyncio.sleep(0.03)
+            while (self._push_pending or self._push_updates) and not self._closing:
+                updates = self._push_updates
+                self._push_updates = {}
+                needs_refresh = self._push_pending
+                self._push_pending = False
+                received_at = self._push_received_at
+                async with self._operation_lock:
+                    data = dict(self.data or {})
+                    for index, (device_type, state) in updates.items():
+                        current = data.get(index)
+                        if current is None or current.device_type != device_type or device_type != 13:
+                            needs_refresh = True
+                            continue
+                        data[index] = replace(current, state=state)
+                    if updates:
+                        self.async_set_updated_data(data)
+                if needs_refresh and not (self.pair_task and not self.pair_task.done()):
+                    await self.async_refresh()
+                if received_at is not None and self.last_update_success:
+                    self.last_push_refresh_seconds = max(0, time.monotonic() - received_at)
+        finally:
+            self._push_task = None
 
     async def async_pair(self):
         if self.pair_task and not self.pair_task.done():
@@ -71,8 +128,15 @@ class EyedotCoordinator(DataUpdateCoordinator):
         self.async_update_listeners()
 
     async def async_close(self):
+        self._closing = True
         self.client.cancel_pairing.set()
+        tasks = []
+        if self._push_task and not self._push_task.done():
+            self._push_task.cancel()
+            tasks.append(self._push_task)
         if self.pair_task and not self.pair_task.done():
             self.pair_task.cancel()
-            await asyncio.gather(self.pair_task, return_exceptions=True)
+            tasks.append(self.pair_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.hass.async_add_executor_job(self.client.close)

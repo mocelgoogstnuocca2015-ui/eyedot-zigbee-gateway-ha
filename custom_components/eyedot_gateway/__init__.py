@@ -24,6 +24,7 @@ async def async_setup_entry(hass, entry):
     coordinator.gateway_device_id = gateway.id
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await coordinator.async_start_events()
     except Exception:
         await coordinator.async_close()
         raise

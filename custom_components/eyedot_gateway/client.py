@@ -1,18 +1,74 @@
 """网关同步协议客户端；由 HA 放入执行线程，所有会话操作按锁串行执行。"""
 
 import ipaddress
+import logging
 import socket
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from .protocol.eyedot_switch_schema import build_switch_payload
 from .protocol.ubia_native_codec import discovery_request
 from .protocol.ubia_read_session import IO_HEADER, NativeReadSession, unpack
 
+LOGGER = logging.getLogger(__name__)
+STATE_EVENTS = frozenset((0x2003, 0x2316))
+
 
 class NativeSession(NativeReadSession):
+    def __init__(self, *args, stop_event=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stop_event = stop_event
+        self._state_event_pending = False
+        self._recent_events = deque(maxlen=64)
+        self.state_event_count = 0
+        self.last_state_event_at = None
+        self._push_updates = {}
+        self._push_requires_refresh = False
+
+    def _poll(self, deadline, *, discovering=False):
+        if self.stop_event and self.stop_event.is_set():
+            raise InterruptedError("网关通信已停止")
+        received = super()._poll(deadline, discovering=discovering)
+        if not received:
+            return None
+        packet, _ = received
+        if packet.command == 0x0408 and packet.channel == self.channel and len(packet.payload) >= 12:
+            kind, _, size, command, sequence, _ = IO_HEADER.unpack_from(packet.payload)
+            if kind == 3 and len(packet.payload) == size + 12 and command in STATE_EVENTS:
+                # 事件也可能在目录查询或控制等待中到达，统一记录，避免被这些路径消费后遗漏。
+                marker = (command, sequence)
+                if marker not in self._recent_events:
+                    self._recent_events.append(marker)
+                    self._state_event_pending = True
+                    self.state_event_count += 1
+                    self.last_state_event_at = time.monotonic()
+                    body = packet.payload[12:]
+                    if command == 0x2003 and len(body) == 24:
+                        # 原 App 的 push_DeviceStateChange 明确读取索引 12、类型 13、状态 14。
+                        # 只直接更新已验证的类型 13，其余消息仍通过目录读取核实。
+                        if body[13] == 13:
+                            self._push_updates[body[12]] = (body[13], body[14])
+                        else:
+                            self._push_requires_refresh = True
+                    else:
+                        self._push_requires_refresh = True
+        return received
+
+    def consume_state_event(self):
+        pending = self._state_event_pending
+        self._state_event_pending = False
+        return pending
+
+    def take_push_updates(self):
+        updates = self._push_updates
+        refresh = self._push_requires_refresh
+        self._push_updates = {}
+        self._push_requires_refresh = False
+        return updates, refresh
+
     def exchange(self, command, body, response, seconds=5):
         self.sequence = self.sequence % 65535 + 1
         sequence = self.sequence
@@ -58,17 +114,14 @@ class NativeSession(NativeReadSession):
 
     def pump(self):
         received = self._poll(time.monotonic() + 0.15)
-        if not received:
-            return False
-        packet, _ = received
-        if packet.command != 0x0408 or packet.channel != self.channel or len(packet.payload) < 12:
-            return False
-        kind, _, size, cmd, seq, _ = IO_HEADER.unpack_from(packet.payload)
-        if kind == 3 and len(packet.payload) == size + 12:
-            # 对网关主动事件及时确认，再通过已核验的查询取完整状态。
-            self._send_av(IO_HEADER.pack(4, 0, 0, cmd, seq, 0))
-            return cmd in (0x2003, 0x2316)
-        return False
+        if received:
+            packet, _ = received
+            if packet.command == 0x0408 and packet.channel == self.channel and len(packet.payload) >= 12:
+                kind, _, size, cmd, seq, _ = IO_HEADER.unpack_from(packet.payload)
+                if kind == 3 and len(packet.payload) == size + 12:
+                    # 即时确认推送；重复包仍回 ACK，但不重复触发同一事件。
+                    self._send_av(IO_HEADER.pack(4, 0, 0, cmd, seq, 0))
+        return self.consume_state_event()
 
 
 def discover_uid(host, bind_ip="0.0.0.0", timeout=6):
@@ -240,6 +293,11 @@ class GatewayClient:
         self._lock = threading.RLock()
         self._closed = threading.Event()
         self.cancel_pairing = threading.Event()
+        self._event_stop = threading.Event()
+        self._event_thread = None
+        self._event_notify = None
+        self.event_notifications = 0
+        self.last_event_received_at = None
 
     def _connect(self):
         if self._closed.is_set():
@@ -248,7 +306,7 @@ class GatewayClient:
             return self._session
         if not self.uid:
             self.uid = discover_uid(self.host)
-        connection = SetupSession(self.host, self.uid, timeout=5)
+        connection = SetupSession(self.host, self.uid, timeout=5, stop_event=self._closed)
         try:
             connection.authenticate(self.username, self.password)
         except Exception:
@@ -314,9 +372,56 @@ class GatewayClient:
                 self._discard()
                 raise
 
+    def start_events(self, notify):
+        with self._lock:
+            if self._closed.is_set():
+                raise RuntimeError("客户端已关闭，不能启动收包")
+            if self._event_thread and self._event_thread.is_alive():
+                return
+            self._event_notify = notify
+            self._event_thread = threading.Thread(target=self._listen_events, name="Eyedot 网关事件", daemon=True)
+            self._event_thread.start()
+
+    def _listen_events(self):
+        while not self._event_stop.is_set():
+            # 查询、控制和配对期间让出同一把锁，只有当前操作能读取此 UDP 会话。
+            # 空闲时持续收包和保活，不在另一个线程抢走请求对应的回复。
+            if not self._lock.acquire(blocking=False):
+                self._event_stop.wait(0.02)
+                continue
+            changed = False
+            received_at = None
+            updates = {}
+            needs_refresh = True
+            try:
+                if self._session and not self._closed.is_set():
+                    changed = self._session.pump()
+                    received_at = self._session.last_state_event_at
+                    if changed:
+                        updates, needs_refresh = self._session.take_push_updates()
+            except (OSError, ValueError, RuntimeError) as error:
+                if not self._event_stop.is_set():
+                    LOGGER.debug("推送接收中断，将通过刷新重连：%s", error)
+                    self._discard()
+                    changed = True
+            finally:
+                self._lock.release()
+            if changed and not self._event_stop.is_set():
+                self.event_notifications += 1
+                self.last_event_received_at = received_at
+                self._event_notify(updates, needs_refresh, received_at)
+            self._event_stop.wait(0.01)
+
+    @property
+    def event_listener_running(self):
+        return self._event_thread is not None and self._event_thread.is_alive()
+
     def close(self):
         self._closed.set()
         self.cancel_pairing.set()
+        self._event_stop.set()
+        if self._event_thread and self._event_thread is not threading.current_thread():
+            self._event_thread.join(timeout=1)
         with self._lock:
             self._discard()
 
