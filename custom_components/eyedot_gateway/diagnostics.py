@@ -12,6 +12,8 @@ async def async_get_config_entry_diagnostics(hass, entry):
         "event_listener_running": coordinator.client.event_listener_running,
         "event_notifications": coordinator.client.event_notifications,
         "last_push_refresh_seconds": coordinator.last_push_refresh_seconds,
+        "rediscovery_count": coordinator.client.rediscovery_count,
+        "last_rediscovery_at": coordinator.client.last_rediscovery_at,
         "devices": [{"index": item.index, "type": item.device_type,
                      "supported": item.device_type == 13, "state": item.state}
                     for item in (coordinator.data or {}).values()],

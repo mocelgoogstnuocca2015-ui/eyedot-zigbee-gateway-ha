@@ -9,9 +9,11 @@ from dataclasses import replace
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry
 
 from .client import GatewayClient
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .discovery import async_discovery_targets
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +41,27 @@ class EyedotCoordinator(DataUpdateCoordinator):
             return self.data or {}
         try:
             async with self._operation_lock:
-                return await self.hass.async_add_executor_job(self.client.fetch)
+                self.client.discovery_targets = await async_discovery_targets(self.hass)
+                data = await self.hass.async_add_executor_job(self.client.fetch)
+                self._async_sync_host()
+                return data
         except PermissionError as error:
             raise ConfigEntryAuthFailed("网关登录失效，请重新认证") from error
         except (OSError, ValueError, RuntimeError, TimeoutError) as error:
             raise UpdateFailed(f"网关读取失败：{error}") from error
+
+    @callback
+    def _async_sync_host(self):
+        host = self.client.host
+        if self.entry.data["host"] == host:
+            return
+        # 只在完整 UID 的新地址完成业务认证后保存；保持配置项和所有子设备标识不变。
+        self.hass.config_entries.async_update_entry(self.entry, data={**self.entry.data, "host": host})
+        registry = device_registry.async_get(self.hass)
+        gateway_id = getattr(self, "gateway_device_id", None)
+        if gateway_id:
+            registry.async_update_device(gateway_id, configuration_url=f"http://{host}")
+        LOGGER.info("已更新网关地址及访问链接，保留原设备和自动化关联")
 
     async def async_control(self, index, channel, on):
         if self.pair_task and not self.pair_task.done():
@@ -51,6 +69,7 @@ class EyedotCoordinator(DataUpdateCoordinator):
         try:
             async with self._operation_lock:
                 data = await self.hass.async_add_executor_job(self.client.control, index, channel, on)
+                self._async_sync_host()
                 self.async_set_updated_data(data)
         except (OSError, ValueError, RuntimeError, TimeoutError) as error:
             await self.async_request_refresh()
@@ -108,6 +127,7 @@ class EyedotCoordinator(DataUpdateCoordinator):
         async def run_pairing():
             try:
                 data = await self.hass.async_add_executor_job(self.client.pair)
+                self._async_sync_host()
                 self.async_set_updated_data(data)
                 self.pair_status = "已完成"
             except asyncio.CancelledError:

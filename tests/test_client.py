@@ -43,6 +43,133 @@ class FakeNative:
 
 
 class ClientTests(unittest.TestCase):
+    def test_startup_with_stale_ip_recovers_same_uid(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        attempts = []
+
+        def factory(host, *args, **kwargs):
+            native = FakeNative()
+            attempts.append((host, native))
+
+            def authenticate(*args):
+                if host == "192.168.50.2":
+                    raise TimeoutError("旧地址已失效")
+
+            native.authenticate = authenticate
+            return native
+
+        with patch("custom_components.eyedot_gateway.client.SetupSession", side_effect=factory), \
+                patch("custom_components.eyedot_gateway.client.discover_host", return_value="192.168.50.9") as discovery:
+            data = client.fetch()
+        self.assertEqual(client.host, "192.168.50.9")
+        self.assertEqual(client.uid, "01234567890123456789")
+        self.assertEqual(data[0].state, 128)
+        self.assertEqual(client.rediscovery_count, 1)
+        self.assertTrue(attempts[0][1].closed)
+        discovery.assert_called_once()
+        client.close()
+
+    def test_read_failure_recovers_even_if_gateway_ip_is_unchanged(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        broken = FakeNative()
+
+        def unavailable():
+            raise TimeoutError("旧 UDP 会话已失效")
+
+        broken.read_devices = unavailable
+        client._session = broken
+        renewed = FakeNative()
+        renewed.authenticate = lambda *args: None
+        with patch("custom_components.eyedot_gateway.client.SetupSession", return_value=renewed), \
+                patch("custom_components.eyedot_gateway.client.discover_host", return_value=client.host):
+            self.assertEqual(client.fetch()[0].state, 128)
+        self.assertTrue(broken.closed)
+        self.assertEqual(client.host, "192.168.50.2")
+        self.assertEqual(client.rediscovery_count, 1)
+        client.close()
+
+    def test_authentication_error_does_not_start_address_scan(self):
+        client = GatewayClient("192.168.50.2", "test", "wrong", "01234567890123456789")
+        native = FakeNative()
+
+        def reject(*args):
+            raise PermissionError("账号密码错误")
+
+        native.authenticate = reject
+        with patch("custom_components.eyedot_gateway.client.SetupSession", return_value=native), \
+                patch("custom_components.eyedot_gateway.client.discover_host") as discovery:
+            with self.assertRaises(PermissionError):
+                client.fetch()
+        discovery.assert_not_called()
+        self.assertTrue(native.closed)
+        self.assertEqual(client.host, "192.168.50.2")
+        client.close()
+
+    def test_failed_discovery_is_rate_limited_and_keeps_saved_address(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        native = FakeNative()
+
+        def offline(*args):
+            raise TimeoutError("网关离线")
+
+        native.authenticate = offline
+        with patch("custom_components.eyedot_gateway.client.SetupSession", return_value=native), \
+                patch("custom_components.eyedot_gateway.client.discover_host", side_effect=TimeoutError) as discovery:
+            for _ in range(2):
+                with self.assertRaises(TimeoutError):
+                    client.fetch()
+        discovery.assert_called_once()
+        self.assertEqual(client.host, "192.168.50.2")
+        self.assertEqual(client.rediscovery_count, 0)
+        client.close()
+
+    def test_new_address_is_not_committed_when_its_authentication_fails(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        attempts = []
+
+        def factory(host, *args, **kwargs):
+            native = FakeNative()
+            attempts.append(native)
+
+            def authenticate(*args):
+                if host == "192.168.50.2":
+                    raise TimeoutError("旧地址失效")
+                raise PermissionError("业务认证失败")
+
+            native.authenticate = authenticate
+            return native
+
+        with patch("custom_components.eyedot_gateway.client.SetupSession", side_effect=factory), \
+                patch("custom_components.eyedot_gateway.client.discover_host", return_value="192.168.50.9"):
+            with self.assertRaises(PermissionError):
+                client.fetch()
+        self.assertEqual(client.host, "192.168.50.2")
+        self.assertTrue(all(native.closed for native in attempts))
+        client.close()
+
+    def test_recovery_after_control_does_not_send_control_twice(self):
+        client = GatewayClient("192.168.50.2", "test", "test", "01234567890123456789")
+        original = FakeNative()
+        reads = []
+
+        def directory():
+            reads.append(1)
+            if len(reads) > 1:
+                raise TimeoutError("控制后网关地址发生变化")
+            return [{"index": 0, "type": 13, "name": "测试开关"}]
+
+        original.read_devices = directory
+        client._session = original
+        renewed = FakeNative()
+        renewed.authenticate = lambda *args: None
+        renewed.query = lambda name: {"记录": [{"设备索引": 0, "状态整数": 129}]}
+        with patch("custom_components.eyedot_gateway.client.SetupSession", return_value=renewed), \
+                patch("custom_components.eyedot_gateway.client.discover_host", return_value="192.168.50.9"):
+            self.assertEqual(client.control(0, 0, True)[0].state, 129)
+        self.assertEqual(original.commands, [(0, 0, True)])
+        self.assertEqual(renewed.commands, [])
+        client.close()
+
     def test_old_directory_room_and_type_offsets_are_not_confused(self):
         session = SetupSession.__new__(SetupSession)
         raw = "测试开关".encode().ljust(32, b"\0") + bytes([7, 4, 13, 0, 255, 255, 255, 255])

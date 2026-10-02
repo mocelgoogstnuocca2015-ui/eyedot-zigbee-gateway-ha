@@ -10,6 +10,7 @@ from homeassistant.helpers import selector
 
 from .client import validate_gateway
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .discovery import async_discovery_targets
 
 
 def connection_schema(defaults=None):
@@ -35,7 +36,9 @@ class EyedotConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             raise ValueError("仅接受明确的局域网 IPv4")
         if any(not value or len(value.encode()) > 12 for value in (data["username"], data["password"])):
             raise ValueError("账号密码须为 1 至 12 个 UTF-8 字节")
-        return await self.hass.async_add_executor_job(validate_gateway, data)
+        # 配置流程也沿用 HA 选择的网卡；已有 UID 时，过期的地址可按同一身份重新定位。
+        return await self.hass.async_add_executor_job(validate_gateway, data,
+                                                     await async_discovery_targets(self.hass))
 
     async def _connection_step(self, step, user_input, defaults=None):
         errors = {}

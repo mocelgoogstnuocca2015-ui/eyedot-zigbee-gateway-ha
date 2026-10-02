@@ -23,6 +23,9 @@ INPUT = {"host": "192.168.50.2", "username": "test", "password": "test", "uid": 
 class FakeClient:
     def __init__(self, host, username, password, uid):
         import threading
+        self.host = host
+        self.rediscovery_count = 0
+        self.last_rediscovery_at = None
         self.uid = uid
         self.closed = False
         self.cancel_pairing = threading.Event()
@@ -72,6 +75,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await entity_registry.async_load(self.hass)
         self.client_patch = patch("custom_components.eyedot_gateway.coordinator.GatewayClient", FakeClient)
         self.client_patch.start()
+        self.coordinator_network_patch = patch("custom_components.eyedot_gateway.coordinator.async_discovery_targets",
+                                               return_value=(("0.0.0.0", "255.255.255.255"),))
+        self.flow_network_patch = patch("custom_components.eyedot_gateway.config_flow.async_discovery_targets",
+                                        return_value=(("0.0.0.0", "255.255.255.255"),))
+        self.coordinator_network_patch.start()
+        self.flow_network_patch.start()
         self.validate_patch = patch("custom_components.eyedot_gateway.config_flow.validate_gateway",
                                     return_value=({**INPUT, "uid": UID}, {}))
         self.validate_patch.start()
@@ -84,6 +93,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.hass.async_stop()
         self.client_patch.stop()
         self.validate_patch.stop()
+        self.coordinator_network_patch.stop()
+        self.flow_network_patch.stop()
         self.directory.cleanup()
 
     async def add_entry(self):
@@ -120,6 +131,20 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"}, data=INPUT)
         self.assertEqual(result["type"], "abort")
         self.assertEqual(result["reason"], "already_configured")
+
+    async def test_recovered_address_updates_config_and_url_without_changing_entities(self):
+        entry = await self.add_entry()
+        registry = entity_registry.async_get(self.hass)
+        before = {row.entity_id for row in entity_registry.async_entries_for_config_entry(registry, entry.entry_id)}
+        uid = entry.unique_id
+        entry.runtime_data.client.host = "192.168.50.9"
+        await entry.runtime_data.async_refresh()
+        self.assertEqual(entry.data["host"], "192.168.50.9")
+        self.assertEqual(entry.unique_id, uid)
+        gateway = device_registry.async_get(self.hass).async_get(entry.runtime_data.gateway_device_id)
+        self.assertEqual(gateway.configuration_url, "http://192.168.50.9")
+        self.assertEqual(before, {row.entity_id for row in entity_registry.async_entries_for_config_entry(registry, entry.entry_id)})
+        self.assertEqual(len(self.hass.config_entries.async_entries(DOMAIN)), 1)
 
     async def test_wrong_password_returns_form_error(self):
         with patch("custom_components.eyedot_gateway.config_flow.validate_gateway", side_effect=PermissionError):

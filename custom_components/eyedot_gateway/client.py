@@ -9,6 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from .discovery import discover_host
 from .protocol.eyedot_switch_schema import build_switch_payload
 from .protocol.ubia_native_codec import discovery_request
 from .protocol.ubia_read_session import IO_HEADER, NativeReadSession, unpack
@@ -298,6 +299,46 @@ class GatewayClient:
         self._event_notify = None
         self.event_notifications = 0
         self.last_event_received_at = None
+        self.discovery_targets = None
+        self.rediscovery_count = 0
+        self.last_rediscovery_at = None
+        self._next_discovery_at = 0
+        self._needs_discovery = False
+
+    def _authenticate_host(self, host):
+        if self._closed.is_set():
+            raise RuntimeError("网关客户端已关闭")
+        connection = SetupSession(host, self.uid, timeout=5, stop_event=self._closed)
+        try:
+            connection.authenticate(self.username, self.password)
+        except Exception:
+            connection.close()
+            raise
+        if self._closed.is_set():
+            connection.close()
+            raise InterruptedError("网关客户端已停止")
+        self._session = connection
+        self.host = host
+        self._needs_discovery = False
+        self._next_discovery_at = 0
+        return connection
+
+    def _rediscover(self):
+        if not self.uid or self._closed.is_set() or time.monotonic() < self._next_discovery_at:
+            return None
+        # 失败时限频，避免长期断电期间每次轮询都广播；恢复后仍只认原网关 UID。
+        self._next_discovery_at = time.monotonic() + 15
+        try:
+            host = discover_host(self.uid, self.discovery_targets, stop_event=self._closed)
+        except (OSError, TimeoutError):
+            if self._closed.is_set():
+                raise InterruptedError("网关客户端已停止")
+            return None
+        connection = self._authenticate_host(host)
+        self.rediscovery_count += 1
+        self.last_rediscovery_at = time.monotonic()
+        LOGGER.info("已按原网关 UID 重新建立局域网连接")
+        return connection
 
     def _connect(self):
         if self._closed.is_set():
@@ -306,14 +347,22 @@ class GatewayClient:
             return self._session
         if not self.uid:
             self.uid = discover_uid(self.host)
-        connection = SetupSession(self.host, self.uid, timeout=5, stop_event=self._closed)
+        attempted_discovery = False
+        if self._needs_discovery:
+            attempted_discovery = True
+            if connection := self._rediscover():
+                return connection
         try:
-            connection.authenticate(self.username, self.password)
-        except Exception:
-            connection.close()
+            return self._authenticate_host(self.host)
+        except PermissionError:
             raise
-        self._session = connection
-        return connection
+        except (OSError, TimeoutError):
+            if self._closed.is_set():
+                raise
+            self._needs_discovery = True
+            if not attempted_discovery and (connection := self._rediscover()):
+                return connection
+            raise
 
     def _discard(self):
         if self._session:
@@ -333,23 +382,37 @@ class GatewayClient:
     def fetch(self):
         with self._lock:
             try:
-                return self._fetch()
+                return self._read_with_recovery()
             except Exception:
                 self._discard()
                 raise
+
+    def _read_with_recovery(self):
+        try:
+            return self._fetch()
+        except PermissionError:
+            raise
+        except (OSError, TimeoutError):
+            had_session = self._session is not None
+            self._discard()
+            self._needs_discovery = True
+            if not had_session or self._closed.is_set():
+                raise
+            # 目录读取可以重试；控制和配对命令不会在这里重复发送。
+            return self._fetch()
 
     def control(self, index, channel, on):
         if not 0 <= channel < 3 or not isinstance(on, bool):
             raise ValueError("只允许三路开关的明确开、关操作")
         with self._lock:
             try:
-                before = self._fetch()
+                before = self._read_with_recovery()
                 if index not in before or before[index].device_type != 13:
                     raise ValueError("设备不存在或不是已验证的三路开关")
                 self._connect().set_channel(index, channel, on)
                 deadline = time.monotonic() + 4
                 while time.monotonic() < deadline:
-                    data = self._fetch()
+                    data = self._read_with_recovery()
                     actual = data.get(index)
                     if actual and actual.state is not None and bool(actual.state & (1 << channel)) == on:
                         return data
@@ -403,6 +466,7 @@ class GatewayClient:
                 if not self._event_stop.is_set():
                     LOGGER.debug("推送接收中断，将通过刷新重连：%s", error)
                     self._discard()
+                    self._needs_discovery = isinstance(error, OSError) and not isinstance(error, PermissionError)
                     changed = True
             finally:
                 self._lock.release()
@@ -426,10 +490,11 @@ class GatewayClient:
             self._discard()
 
 
-def validate_gateway(data):
+def validate_gateway(data, discovery_targets=None):
     client = GatewayClient(data["host"], data["username"], data["password"], data.get("uid", ""))
+    client.discovery_targets = discovery_targets
     try:
         devices = client.fetch()
-        return {**data, "uid": client.uid}, devices
+        return {**data, "host": client.host, "uid": client.uid}, devices
     finally:
         client.close()
